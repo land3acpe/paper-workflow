@@ -1,0 +1,23 @@
+# Simulink
+*.slxc
+*.autosave
+slprj/
+
+# MATLAB
+*.m~
+*.asv
+
+# Platform config (users create from .example.md)
+.claude/skills/paper-workflow/platform-profile.md
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDE
+.vscode/
+.idea/
+
+# Agent runtime
+.agent-status/
