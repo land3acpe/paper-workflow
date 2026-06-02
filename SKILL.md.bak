@@ -1,0 +1,328 @@
+---
+name: paper-workflow
+description: Use when working on DTP-PMSM control algorithm deployment involving paper/reference-model translation, Simulink FOC current-loop changes, xy-subspace harmonic suppression, C2000/TMS320F28377D code integration, or DSP ISR deployment.
+---
+
+# Paper Workflow: 论文算法 → Simulink → DSP
+
+## 优先级规则
+
+**P0 — 上下文窗口超过 50% 时，在下一个任务开始前执行上下文压缩。** 若平台支持则执行 compact；否则先总结当前状态、产物、阻塞点，再继续。不得在上下文接近极限的状态下开始新的复杂任务。该规则优先级高于其他所有规则。
+
+**P1 — 每个 Phase 开始前，必须先查阅 [积累的经验](#积累的经验)。** 逐条比对当前任务（电机参数、算法类型、工况）与已有经验中记录的条件是否匹配。匹配的经验必须应用；不匹配的记录跳过但保留。不得跳过此步骤直接开始工作。
+
+**P2 — 修改 Simulink/DSP 文件前，必须检查 git 状态、复制参考模型、不得直接覆盖参考模型。** 新模型另存为独立文件；DSP 原代码段用条件编译保留，不删除。
+
+## 概述
+
+将论文或参考模型中的控制算法移植到双三相 PMSM 平台的标准化流程。4 个 Phase，每个 Phase 结束有审批门，用户明确确认后才进入下一阶段。
+
+**核心原则：**
+- 设计先于编码——Phase 1 必须产出完整设计文档
+- 用户掌控决策——每个 Phase 的"进入下一步"由用户说了算
+- 经验积累——使用后发现的规律，先展示给用户，确认后才写入 skill
+
+## Phase 1: 方案设计
+
+采用 brainstorming 模式，在写任何代码前完成完整设计。
+
+### 1a. 探索项目上下文
+
+**前提检查：**
+- 确认 MATLAB MCP server 已连接并可调用 `evaluate_matlab_code`
+- 确认所需工具箱：Simscape Electrical（电机模型）、Stateflow（EMChart）、Motor Control Blockset（如适用）
+
+**检查并报告：**
+- 参考模型结构（.slx 顶层子系统、采样时间 Tsimu、PWM 配置 fsw）
+- 需要改动的顶层块：Vdc1 电压、Speed_Ref 信号链路（Step→ZOH→Speed_Controller）、TorqueCmd_Zero 负载转矩、PWM Generator ABC/XYZ 的 fsw
+- 目标电机参数（Rs, Ld, Lq, Lz, Flux, Pn）——从 PMSM block 实际读取，不要依赖记忆
+- 当前 Current_Controller 下 xy 轴控制子系统的确切路径和类型（SubSystem / EMChart / S-Function）
+- 已存在的算法代码和控制器架构
+- DSP 项目结构（ISR 位置、CL_TS 定义、数据类型 REAL 的 typedef）
+
+### 1b. 逐轮澄清（每次一个问题）
+
+必须确认的事项（逐个提问，不要批量）：
+- 算法来源（论文名称/章节 / 参考模型中的具体子系统 / 已有代码）？
+- 部署目标轴——d/q 轴还是 xy 轴？控制目标是什么（跟踪 / 抑制 / 解耦）？
+- 控制频率（Ts）和 PWM 频率（fsw）？是否多速率？Ts 与 CL_TS 是否一致？
+- 母线电压和额定工况（转速、负载转矩、额定电流）？
+- DSP 目标型号（TMS320F28377D / F28379D / F28069）和编译器（TI C2000）？
+- 是否有额外的谐振控制器 / 前馈需要保留？
+
+### 1c. 可行性预判
+
+公式推导之前，先做物理可行性快速评估。计算 `E_peak = Flux × Pn × ω_mech`，`vlim = Udc/√3`，`margin = vlim − E_peak`：
+
+| 条件 | 判定 | 处理 |
+|------|------|------|
+| margin > 0.2 × vlim | 可行 | 继续 |
+| 0.1 × vlim < margin ≤ 0.2 × vlim | 临界 | 警告用户 |
+| margin ≤ 0.1 × vlim | 不可行 | **告知用户必须降速或升压**，暂停流程 |
+
+### 1d. 公式推导
+
+展示完整推导链，逐节等用户确认：
+
+1. **源算法连续域方程** — 控制律 + 观测器（如有）
+2. **离散化** — Forward Euler / Tustin，明确 Ts
+3. **VSD 坐标适配** — 双 dq → VSD 变换关系，说明 xy 子空间电压方程：u_xy = Rs·i_xy + Lz·di_xy/dt + e_xy（反电动势谐波为扰动）。确认仿真和 DSP 用同一套 VSD 变换矩阵（T6→T2 是否转置、相序是否一致）
+4. **观测器误差符号约定** — 必须明确：`e1 = i_meas − z1`（标准 LESO）还是 `e1 = z1 − i_meas`。一旦选定，控制律中 z2 前馈的符号必须与之匹配，否则扰动补偿反相
+5. **完整离散控制律** — 每个采样周期的计算步骤（ESO/观测器更新 → 控制律 → 饱和），标注前一步的输出作为下一步的输入（如 u_prev 的一拍延迟）
+6. **饱和与限幅** — vlim = Udc/√3，检查反电动势是否留有足够电压裕量（反电动势峰值 + 控制电压 < vlim）
+
+### 1e. 仿真改造方案
+
+对照参考模型，逐项列出需改动的内容：
+
+| 改动类型 | 具体内容 |
+|----------|---------|
+| 新增子系统 | 在 Current_Controller 下新增 MATLAB Function (EMChart) 块 |
+| 替换子系统 | 用新算法替换原有 ix_ESO / iy_ESO |
+| 信号路由 | Goto/From 标签、To Workspace 新增信号（至少 ix, iy, iq, n_real, Ux） |
+| InitFcn | 新建 xxx_params.m，设**绝对路径**（避免 MATLAB 工作目录不同时报错） |
+| 参数文件 | 电机参数 + 控制参数 + 扫参范围 |
+| 多速率 | Tsimu（物理步长）/ Ts（控制周期）/ Tpwm（PWM 周期 = 1/fsw）三级配置 |
+| 母线电压 | Vdc1 块的值，确保 vlim = Udc/√3 有足够裕量 |
+| PWM 频率 | PWM Generator ABC 和 XYZ 的 fsw 参数 |
+| 负载转矩 | TorqueCmd_Zero 块的值（对 6 相 PMSM，Te = 3×Pn×Flux×iq） |
+| 转速参考 | Speed_Ref 信号链路——如果是 Step→ZOH→Speed_Controller 则改 Step 的 After 值；如果直接用 rad/s 则改 Constant 值 |
+
+展示一张信号流草图（ASCII），从参考输入 → 速度环 → dq 电流环 → xy 控制器（标出新算法插入点）→ VSD 逆变换 → PWM → 电机 → 采样 → VSD 正变换 → 回到控制器。
+
+#### 多速率系统配置
+
+三级时间基准：Tsimu（物理）< Ts（控制）≤ Tpwm（PWM = 1/fsw）。关键约束：
+
+- Tsimu ≤ 1/(10×fsw)，否则 PWM Generator 报错
+- EMChart 采样时间 = Ts，不是 Tsimu
+- 过采样（Ts < Tpwm）时每 PWM 周期算多次，取最后一次结果；同步（Ts = Tpwm）最常见
+- 不同速率子系统连接处必须插入 Rate Transition 块：控制器输出 [Ts] → RT → PWM [Tpwm]；采样 [Tsimu] → RT → 控制器 [Ts]
+
+### 1f. 参数计划
+
+论文参数作为初始值，标注需要扫参的范围和优先级：
+
+```
+参数          初始值          扫参范围           优先级
+omega_o       4000            [1000, 64000]      ★★
+lam1          20000           [5000, 200000]     ★★★
+lam2          2e6             [5e5, 2e7]         ★★★
+```
+
+### 1g. 验收标准
+
+逐项与用户沟通确定，不设默认值：
+
+| 指标 | 候选值 | 用户确认 |
+|------|--------|---------|
+| THD 目标 | ≤ 10% | ? |
+| 转速稳态误差 | ≤ 1 rpm | ? |
+| 电压裕量 | Ux_peak ≤ 80% vlim | ? |
+| 工况范围 | 最低/额定/最高转速 + 空载/满载 | ? |
+
+### Phase 1 产出物
+
+完整的 Markdown 设计文档，保存到项目 docs/superpowers/specs/ 目录。
+
+**审批门：** 设计文档保存后，展示摘要（关键参数、算法选择、改动清单、验收标准），明确询问：
+
+> 设计文档已完成。是否进入 Phase 2 Simulink 建模阶段？
+
+用户确认后才开始修改模型。
+
+## Phase 2: Simulink 建模与调参
+
+按 Phase 1 设计文档执行。关键步骤：
+
+1. 复制参考模型 → 重命名
+2. 修改 InitFcn 指向新参数文件（用**绝对路径**，避免 MATLAB 工作目录不同时报错）
+3. 修改顶层块参数：Vdc1（母线电压）、TorqueCmd_Zero（负载转矩）、Speed_Ref（转速参考值）、PWM Generator fsw
+4. 在 Current_Controller 中替换或新增控制器子系统
+5. 用 MATLAB Function (EMChart) 写离散算法
+
+**EMChart 程序化修改方法：**
+```matlab
+rt = sfroot;
+m = rt.find('-isa', 'Stateflow.Machine', 'Name', 'MODEL_NAME');
+chart = m.find('-isa', 'Stateflow.EMChart', 'Name', 'CHART_NAME');
+chart.Script = new_script_string;  % 替换整个脚本
+save_system('MODEL_NAME');
+```
+
+6. 增加 To Workspace 块（至少：ix, iy, iq, id, n_real, Ux）
+7. 扫参：omega_o → lam1 → lam2，THD = sqrt(ix_rms² + iy_rms²) / |iq_mean| × 100，取稳态（最后 40%）
+
+**审批门：** 展示结果后询问：
+
+> 转速：xxx rpm（目标 xxx），iq：xx A，ix_rms：xx A，iy_rms：xx A
+> THD：xx%（目标 ≤ xx%），电压峰值：xx V（vlim=xx V，利用率 xx%）
+> 是否通过？[通过进入 Phase 3 / 调整参数重新仿真 / 修改工况]
+
+### Phase 2 异常处理
+
+扫参过程中可能遇到以下异常，不要当作普通调参继续，应按对应策略处理：
+
+| 异常 | 症状 | 处理策略 |
+|------|------|---------|
+| **仿真不收敛 / 发散** | ix/iy 指数增长、报 "solver error" | ESO 或 STSM 增益过大导致数值不稳定。将 omega_o 和 lam1/lam2 各降为当前值的 1/10 重试，确认稳定后再逐步提高 |
+| **持续饱和** | Ux/Uy 一直贴 vlim，控制电压截顶 | 控制电压裕量不足。检查：① vlim 是否与 Udc 匹配；② 反电动势是否已达到上限（回查 Phase 1 可行性预判）。如裕量确实不够，需回到 Phase 1 和用户确认是否降速或升压 |
+| **THD 比开环还差** | 闭环 THD > 开环 THD | ESO 误差符号反了或 STSM 符号反了。检查 `e1` 和 z2 前馈符号是否一致 |
+| **THD 随迭代走平** | 扫参中 THD 稳定在一个偏高值不动 | 已触及该工况的物理下限（PWM 纹波、死区等）。3 组不同数量级仍无改善则停止，报告用户 |
+
+## Phase 3: 仿真验证与 DSP 决策
+
+用户确认 Phase 2 结果后，在执行 DSP 部署前完成最终验证：
+
+- 多工况验证（不同转速、负载组合，至少覆盖额定和极端工况）
+- FFT 分析谐波分布——确认主要谐波峰值在 6fe 和 12fe（fe = Pn × n_rpm / 60）。用 `pwelch(ix, [], [], [], 1/Ts)` 做功率谱密度分析
+
+- 汇总最终结果表（工况 / 转速 / iq / ix_rms / iy_rms / THD / 电压峰值）
+- 确认所有硬编码参数已同步到参数文件
+
+**明确询问：**
+> 以上为最终仿真结果。是否进入 Phase 4 DSP 部署阶段？
+> 确认后将生成 C 代码并集成到 ISR 中。代码修改前必须 git 备份/提交；硬件验证失败时可通过条件编译或运行时开关回退。
+
+这是最后一个审批门，用户确认后进入 DSP 部署。
+
+## Phase 4: DSP 部署
+
+### 4a. 算法代码生成
+
+两个文件：
+- `xxx.h` — struct 定义（状态/参数/I/O）+ 函数声明 + extern 实例 + 头文件保护
+- `xxx.c` — init（设默认参数、清零状态）+ calc（ESO+控制律+饱和）+ xy_control（读 CTRL.I、写 CTRL.O）
+
+匹配项目风格：REAL 类型、fabsf/sqrtf、struct 命名约定、全局 CTRL 结构体。
+
+**关键注意事项：**
+- .c 中的 Ts 默认值必须与 DSP 项目的 CL_TS 一致；如果 CL_TS 定义在 ACMConfig.h 中，初始化时用 `p->Ts = CL_TS` 而非硬编码
+- sign_f 函数需处理 x=0 返回 0，避免积分器漂移
+
+### 4b. 中断集成
+
+找到 PWM ISR 中的控制调用点（通常是 `null_d_control()` 或类似函数），定位 xy 轴控制段。
+
+**条件编译模式（推荐）：** 在 ACMConfig.h 中定义宏，保留原 PI 代码供对比：
+
+```c
+// ACMConfig.h
+#define XY_CONTROLLER_STSM_LESO  1  // 1 = STSM+LESO, 0 = original PI
+
+// pmsm_controller.c 中 null_d_control():
+#if XY_CONTROLLER_STSM_LESO
+    stsm_leso_xy_control();
+#else
+    // 原 PI 代码保留
+    pid2_id.Fbk = CTRL.I->idq[0+2];
+    pid2_id.calc(&pid2_id);
+    // ...
+#endif
+```
+
+确保时序：电流采样完成 → 算法计算 → 结果写入 udq_cmd → PWM 更新。算法调用必须在 Fbk 赋值之后、udq_cmd 被 PWM 模块读取之前。
+
+> **运行时切换：** `#define` 宏只能在编译时切换，无法在 CCS Watch Window 中实时修改。如需上机实时 A/B 对比，改用 `volatile uint16_t g_xy_controller_mode`（1=STSM+LESO, 0=PI），在 `null_d_control()` 中用 `if` 分支。宏方案适合发布固化；volatile 方案适合调试调参。
+
+### 4c. 集成检查清单
+
+- [ ] init 函数在 init_experiment() 中调用（在 init_CTRL() 之后）
+- [ ] ISR 中调用在 Fbk 赋值之后、udq_cmd 使用之前
+- [ ] 饱和保护生效（vlim 匹配实际 Udc）
+- [ ] 防积分饱和——STSM 的 v 积分器在饱和时应停止积分
+- [ ] DAC 观测通道不冲突（建议分配：z2 扰动估计、Out 控制电压、Fbk 电流反馈）
+- [ ] CCS 项目已添加 .c 文件
+- [ ] `#include "stsm_leso.h"` 已添加到 ACMSim.h 或对应头文件
+- [ ] 编译通过，零 warning
+
+### 4d. 硬件安全门
+
+DSP 上机属于高风险物理操作。进入 4e 上机验证前，必须逐项确认：
+
+- [ ] **低压/空载首测：** 首次上电用低压（如 Udc=50V）或空载，确认算法不失控后再升压加载
+- [ ] **电流限幅：** 确认 `vlim` 和硬件过流保护阈值已设置（不超过电机/驱动器额定电流的 1.5 倍）
+- [ ] **速度斜坡：** 转速参考使用斜坡函数（非阶跃），斜率 ≤ 额定转速/秒
+- [ ] **急停可用：** 确认急停按钮/IO 已连接且功能正常
+- [ ] **PWM 先禁能验证变量：** 上电后先在 PWM 禁能状态下通过 CCS Watch Window 验证各变量初始值正确，再使能 PWM
+- [ ] **DAC 缩放检查：** DAC 输出缩放系数与实际电压/电流范围匹配，避免示波器过压
+- [ ] **过流保护确认：** 硬件过流保护（CMPSS/Trip-Zone）已配置并测试
+- [ ] **示波器探头安全：** 差分探头隔离等级足够；探头地线不形成对地短路回路
+
+### 4e. 上机验证与回退
+
+**验证：** 通过 DAC 观测 z2（应显示 6fe 正弦）、Out（应在 vlim 内）、Fbk（RMS 应与仿真可比）。偏差 >5% 时先查 CL_TS。推荐通过 SCI/CAN 上传原始数据到 PC 做 MATLAB 离线 FFT 对比。
+
+**回退：** 条件编译方案——`#define XY_CONTROLLER_STSM_LESO 0` 重新编译即切回原 PI；运行时方案——CCS Watch Window 中将 `g_xy_controller_mode` 写 0。判断标准：THD 比仿真差 >10%、持续饱和、或电机异常啸叫。**绝不删除原 PI 代码段。**
+
+## 经验积累机制
+
+每次使用 skill 调参过程中产生的新发现，Phase 结束之后展示给用户：
+
+> 本次发现：
+> - [发现 1]
+> - [发现 2]
+>
+> 是否写入经验区？
+
+用户确认后才写入。写入时分两类：
+
+| 类型 | 存储位置 | 内容 |
+|------|---------|------|
+| **通用规律** | 写入 skill 的 [积累的经验](#积累的经验) | 与具体项目/电机参数无关的跨项目规律（如 "ESO 误差符号必须与控制律一致"） |
+| **项目特定记录** | 写入项目 `docs/superpowers/experience.md` | 与特定电机参数、特定论文、特定工况绑定的经验（如 "电机 A 的 Lz=4.2mH 时 STSM 增益需设 lam1≥20000"），skill 中加一行引用链接 |
+
+### 经验条目模板（通用规律）
+
+每条经验必须包含以下元数据：
+
+```markdown
+### 经验 #N: [一句话标题]
+
+| 字段 | 内容 |
+|------|------|
+| 适用算法 | STSM / LESO / ADRC / SMC / ... |
+| 适用条件 | [什么情况下这条经验生效，用于 agent 自动匹配] |
+| 编辑日期 | YYYY-MM-DD |
+| 触发阶段 | Phase 1 / 2 / 3 / 4 |
+
+**经验内容：**
+[详细描述发现的规律、原因和应对方法]
+```
+
+> **Agent 匹配规则：** 逐条比对当前任务的算法类型、工况与每条经验的 `适用条件` 字段。条件匹配的经验强制执行；条件不匹配的跳过。
+
+多条经验按编辑日期倒序排列。
+
+## 积累的经验
+
+（当前为空，等待用户确认后写入。项目特定经验见项目 `docs/superpowers/experience.md`）
+
+## 常见陷阱
+
+以下为本流程中高频出现的错误，Phase 2/4 执行前必须过一遍：
+
+| # | 陷阱 | 症状 | 预防 |
+|---|------|------|------|
+| 1 | **ESO 误差符号不一致** | THD 比开环还差，扰动补偿反相 | 明确约定 `e1 = i_meas − z1`，控制律中 z2 前馈用 `−z2` |
+| 2 | **转速单位混用** | 电机转速完全不对 | 确认 Speed_Ref 用的是 rpm（经 pi/30 转换）还是 rad/s（直接） |
+| 3 | **反电动势饱和** | 转速上不去、THD 突增 | 先算：E_peak = Flux×Pn×ω_mech，确保 E_peak + 控制电压 < vlim |
+| 4 | **轻载时 THD 无意义** | THD > 100% | iq 接近零时分母太小，必须带负载（至少半载）再算 THD |
+| 5 | **EMChart 参数硬编码** | 改了 workspace 参数但仿真结果不变 | EMChart 内的变量是独立脚本，不会自动读取 workspace；需用 sfroot 程序化修改或确保 chart 脚本从 workspace 读取 |
+| 6 | **InitFcn 相对路径** | 从不同目录打开模型时报错找不到 params.m | 一律用绝对路径：`run('C:/.../xxx_params.m')` |
+| 7 | **变量覆盖** | 参数文件定义了与模型内部同名的变量，互相覆盖 | params 文件中的变量名加前缀（如 `stsm_lam1`），避免与 dq 轴控制器参数重名 |
+| 8 | **DSP 代码 Ts 不匹配** | DSP 跑出来的 THD 与仿真差很多 | 检查 .c 中 `p->Ts` 的默认值是否等于实际 CL_TS |
+| 9 | **STSM 有效增益理解错误** | 换电机参数后 THD 恶化 | 实际增益 = Lz × lam（因为 u = Lz × lam × sign(s) + ...），需按 Lz 反比缩放 lam |
+| 10 | **PWM fsw 与 Ts 不匹配** | 模型报错 "Sample time must be ≤ 1/(10×fsw)" | Tsimu ≤ 1/(10×fsw)，多速率时检查各级 sample time |
+| 11 | **端口未连接警告** | 黄色警告但模型能跑 | pi/30 Gain 块输出悬空等——虽不影响仿真但会污染诊断信息，应接 Terminator 或删除 |
+| 12 | **VSD 变换矩阵不一致** | xy 电流始终有直流偏移 | 仿真和 DSP 用同一套 VSD 变换（确认 T6→T2 是否转置、6 相到 αβ 的 Clarke 矩阵是否一致、相序 ABC-XYZ 还是 ABC-ZXY） |
+| 13 | **DSP 浮点精度不足** | 长时间运行后 ESO 状态漂移 | float(32-bit) 对 Ts=1e-5 的极小增量可能累积舍入误差；关键积分器（z1, z2, v）考虑用 double 存储，或加入定期复位机制（如每 10 秒将 v 归零后重新建立） |
+
+## 子技能
+
+| 技能 | 关系 | 用途 |
+|------|------|------|
+| brainstorming | **必需** | Phase 1 澄清流程——逐轮挖掘用户需求 |
+| writing-plans | **必需** | Phase 1 设计文档完成后，生成结构化实现计划 |
+| verification-before-completion | **必需** | 每个 Phase 结束时验证产出物 |
+| chinese-documentation | 可选 | 设计文档需要正式排版时调用 |
