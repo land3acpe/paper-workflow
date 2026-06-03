@@ -20,6 +20,8 @@ description: Use when working on DTP-PMSM control algorithm deployment involving
 - 若 `platform-profile.md` 不存在、某占位符表中没有、或对应值仍是空/占位符：**停下来，向用户提问获取真实符号，绝不猜测、绝不照抄 `.example` 或示例工程（如 `M_DualThree_VSD_FOC`）里的名字。**
 - 红线：在最终代码里出现任何未替换的 `<占位符>`，或把示例工程的 `null_d_control`/`CTRL.I`/`ACMConfig.h` 等私有符号当成当前工程符号 —— 都属于规则违反，停下重做。
 
+**P4 — DSP 代码生成后必须执行强制自检；查出问题必须返工重改，直至全部通过。** 自检按 `dsp-deployment.md` §4b 的五级清单逐项核对：编译预检 → 符号交叉引用 → 逻辑正确性 → 条件编译回退 → 返工规则。任一项不通过即回退到代码生成步骤修复，不得跳过。只有自检全部通过后才允许进入 ISR 集成。此规则优先级与 P2/P3 同级——代码没通过自检就不能说 Phase 4 完成了。
+
 ## 概述
 
 将论文或参考模型中的控制算法移植到双三相 PMSM 平台的标准化流程。4 个 Phase，每个 Phase 结束有审批门，用户明确确认后才进入下一阶段。
@@ -211,9 +213,9 @@ save_system('MODEL_NAME');
 
 ## Phase 4: DSP 部署
 
-> **进入前必读：** [`references/dsp-deployment.md`](references/dsp-deployment.md)。该文件含完整部署流程：4a 算法代码生成、4b 中断集成（条件编译/运行时切换）、4c 集成检查清单、**4d 硬件安全门（高风险物理操作，逐项确认）**、4e 上机验证与回退。
+> **进入前必读：** [`references/dsp-deployment.md`](references/dsp-deployment.md)。该文件含完整部署流程：4a 算法代码生成 → **4b 代码自检与返工（强制门控）** → 4c 中断集成（条件编译/运行时切换）→ 4d 集成检查清单 → **4e 硬件安全门（高风险物理操作，逐项确认）** → 4f 上机验证与回退。
 
-DSP 上机属于高风险操作，必须按 dsp-deployment.md 的 4d 硬件安全门逐项确认后才能上电。**绝不删除原 PI 代码段**（保留供条件编译回退）。
+DSP 上机属于高风险操作，必须按 dsp-deployment.md 的 4e 硬件安全门逐项确认后才能上电。**绝不删除原 PI 代码段**（保留供条件编译回退）。代码生成后必须通过 4b 自检才能进入后续步骤——自检不通过即返工，不得跳过。
 
 ## 经验积累机制
 
