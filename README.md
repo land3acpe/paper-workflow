@@ -1,6 +1,13 @@
 # Paper Workflow
 
-论文算法 → Simulink 仿真 → DSP 部署 的标准化流水线 skill。用于将论文中的控制算法（ESO、STSM、ADRC、SMC、谐振等）移植到双三相 PMSM FOC 平台（TMS320F28377D）。
+将论文控制算法移植到双三相 PMSM FOC 平台（TMS320F28377D）的标准化流水线 skill。主 Agent 按固定顺序编排三个子 Agent：
+
+```
+research agent → Simulink agent → DSP agent
+   (Phase 1)       (Phase 2)        (Phase 4)
+```
+
+后一个依赖前一个的产出。每个子 Agent 完成后生成 `.md` 工作报告并与用户确认。子 Agent 遇到不确定信息时执行**不确定性上报**：停下 → 查前序文档 → 问用户 → 继续，禁止猜测。
 
 ## 快速开始
 
@@ -8,16 +15,35 @@
 /paper-workflow
 ```
 
-启动后自动执行 Phase 0 工作区预扫描 → Phase 1 方案设计 → Phase 2 Simulink 建模 → Phase 3 仿真验证 → Phase 4 DSP 部署。
+启动后自动执行：
+
+| Phase | Agent | 产出 |
+|-------|-------|------|
+| **Phase 0** | 主 Agent | 工作区预扫描，确认论文/DSP工程/仿真模板三项就位 |
+| **Phase 1** | research agent | 算法提取 + 离散化推导 + 设计文档 |
+| **Phase 2** | Simulink agent | Simulink 建模 + 扫参调参 + 仿真结果 |
+| **Phase 3** | 主 Agent | 多工况验证 + FFT 分析 + 最终确认 |
+| **Phase 4** | DSP agent | C 代码生成 + 自检 + ISR 集成 + 部署 |
 
 ## 前置条件
 
-用户必须在工作区提供：
+用户必须在工作区提供以下三项，缺一不可：
 - **论文/参考文献**（PDF 或 .md）
 - **DSP 工程目录**（含 ISR 入口、配置头文件）
 - **仿真模板**（Simulink .slx，含电机模型 + FOC 基础架构）
 
-三项缺一不可。Skill 本身不提供模板，缺失则暂停。
+Skill 本身不提供模板，缺失则暂停流程。
+
+## 优先级规则
+
+| 优先级 | 规则 |
+|--------|------|
+| **P0** | 上下文超过 50% 时执行压缩 |
+| **P1** | 子 Agent 顺序执行，不确定性上报 |
+| **P2** | 每阶段前查阅积累的经验 |
+| **P3** | 修改文件前做版本备份 |
+| **P4** | 写代码前加载 platform-profile.md 替换占位符 |
+| **P5** | DSP 代码生成后强制自检 |
 
 ## 文件结构
 
